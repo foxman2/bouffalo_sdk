@@ -821,9 +821,13 @@ static struct usbh_hubport *usbh_list_all_hubport(struct usbh_hub *hub, uint8_t 
     struct usbh_hubport *hport;
     struct usbh_hub *hub_next;
 
-    USB_ASSERT((hub_index > 0) && (hub_port > 0) && (hub_index <= hub->index) && (hub_port <= hub->nports));
+    USB_ASSERT((hub_index > 0) && (hub_port > 0));
 
     if (hub->index == hub_index) {
+        /* The requested port belongs to the matching hub, not its ancestors. */
+        if (hub_port > hub->nports) {
+            return NULL;
+        }
         hport = &hub->child[hub_port - 1];
         if (hport->connected) {
             return hport;

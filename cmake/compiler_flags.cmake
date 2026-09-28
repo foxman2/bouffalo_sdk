@@ -58,11 +58,16 @@ sdk_add_link_options(
     -Wl,--gc-sections
     -nostartfiles
     -fms-extensions
-    -flto
     -ffunction-sections
     -fdata-sections
     -Wl,--print-memory-usage
 )
+
+if(CONFIG_GCC_COMPILE_LTO)
+    sdk_add_link_options(-flto)
+else()
+    sdk_add_link_options(-fno-lto)
+endif()
 
 if(CONFIG_GCC_LINK_NO_RELAX)
     sdk_add_link_options(-Wl,--no-relax)

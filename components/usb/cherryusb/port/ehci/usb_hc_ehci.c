@@ -21,8 +21,12 @@ USB_NOCACHE_RAM_SECTION struct ehci_qtd_hw ehci_qtd_pool[CONFIG_USBHOST_MAX_BUS]
 
 /* The head of the asynchronous queue */
 USB_NOCACHE_RAM_SECTION struct ehci_qh_hw g_async_qh_head[CONFIG_USBHOST_MAX_BUS];
-/* The head of the periodic queue */
-USB_NOCACHE_RAM_SECTION struct ehci_qh_hw g_periodic_qh_head[CONFIG_USBHOST_MAX_BUS];
+/* Each level serves a power-of-two frame interval. All levels share their
+ * shorter-period tails, so one traversal from the longest head visits every
+ * request exactly once. The frame list and dummy heads live for the whole bus. */
+#define EHCI_PERIODIC_LEVELS (CONFIG_USB_EHCI_FRAME_LIST_SIZE == 1024 ? 11 : \
+                              CONFIG_USB_EHCI_FRAME_LIST_SIZE == 512 ? 10 : 9)
+USB_NOCACHE_RAM_SECTION struct ehci_qh_hw g_periodic_qh_head[CONFIG_USBHOST_MAX_BUS][EHCI_PERIODIC_LEVELS];
 
 /* The frame list */
 USB_NOCACHE_RAM_SECTION uint32_t g_framelist[CONFIG_USBHOST_MAX_BUS][USB_ALIGN_UP(CONFIG_USB_EHCI_FRAME_LIST_SIZE, 1024)] __attribute__((aligned(4096)));
@@ -139,6 +143,8 @@ static inline void ehci_qh_add_head(struct ehci_qh_hw *head, struct ehci_qh_hw *
 
     usb_dcache_flush((uintptr_t)n->urb->transfer_buffer, USB_ALIGN_UP(n->urb->transfer_buffer_length, CONFIG_USB_ALIGN_SIZE));
 
+    /* The link and DMA contents must be visible before publishing the QH. */
+    __sync_synchronize();
     head->hw.hlp = QH_HLP_QH(n);
 #if defined(CONFIG_USB_EHCI_DESC_DCACHE_ENABLE)
     usb_dcache_clean((uintptr_t)&head->hw, CONFIG_USB_EHCI_ALIGN_SIZE);
@@ -161,26 +167,67 @@ static inline void ehci_qh_remove(struct ehci_qh_hw *head, struct ehci_qh_hw *n)
     }
 }
 
+/* LS/FS intervals are frames; round down to a power of two. HS intervals
+ * are powers of two microframes. Intervals beyond the hardware frame list are
+ * capped at one list revolution (1024 ms in MXStreaming). */
+static unsigned int ehci_periodic_level(uint8_t speed, uint8_t interval)
+{
+    unsigned int frames = interval;
+    if (speed == USB_SPEED_HIGH) {
+        frames = interval <= 4 ? 1u : 1u << (interval - 4);
+    }
+    unsigned int level = 0;
+    while (level + 1 < EHCI_PERIODIC_LEVELS && (2u << level) <= frames) {
+        level++;
+    }
+    return level;
+}
+
 static int ehci_caculate_smask(int binterval)
 {
-    int order, interval;
+    if (binterval == 1) return 0xff; /* Every microframe. */
+    if (binterval == 2) return 0x55; /* Every two microframes. */
+    if (binterval == 3) return 0x11; /* Every four microframes. */
+    return 1; /* Longer intervals are selected by the frame list. */
+}
 
-    interval = 1;
-    while (binterval > 1) {
-        interval *= 2;
-        binterval--;
+static void ehci_periodic_init(struct usbh_bus *bus)
+{
+    struct ehci_qh_hw *heads = g_periodic_qh_head[bus->hcd.hcd_id];
+    memset(heads, 0, sizeof(g_periodic_qh_head[0]));
+    for (unsigned int level = 0; level < EHCI_PERIODIC_LEVELS; level++) {
+        struct ehci_qh_hw *head = &heads[level];
+        head->hw.hlp = level ? QH_HLP_QH(&heads[level - 1]) : QH_HLP_END;
+        head->hw.epcap = QH_EPCAPS_SSMASK(1);
+        head->hw.overlay.next_qtd = QTD_LIST_END;
+        head->hw.overlay.alt_next_qtd = QTD_LIST_END;
+        head->hw.overlay.token = QTD_TOKEN_STATUS_HALTED;
+        head->first_qtd = QTD_LIST_END;
     }
+    for (unsigned int frame = 0; frame < CONFIG_USB_EHCI_FRAME_LIST_SIZE; frame++) {
+        unsigned int level = 0;
+        while (level + 1 < EHCI_PERIODIC_LEVELS && (frame % (2u << level)) == 0) {
+            level++;
+        }
+        g_framelist[bus->hcd.hcd_id][frame] = QH_HLP_QH(&heads[level]);
+    }
+#if defined(CONFIG_USB_EHCI_DESC_DCACHE_ENABLE)
+    usb_dcache_clean((uintptr_t)heads, sizeof(g_periodic_qh_head[0]));
+#endif
+}
 
-    if (interval < 2) /* interval 1 */
-        return 0xFF;
-    if (interval < 4) /* interval 2 */
-        return 0x55;
-    if (interval < 8) /* interval 4 */
-        return 0x22;
-    for (order = 0; (interval > 1); order++) {
-        interval >>= 1;
+/* Called with USB interrupts excluded. PSS, not just the PSEN command bit,
+ * proves that the controller no longer holds periodic descriptor references.
+ * On failure leave the URB and DMA storage owned by hardware for a later retry. */
+static bool ehci_periodic_pause(struct usbh_bus *bus)
+{
+    EHCI_HCOR->usbcmd &= ~EHCI_USBCMD_PSEN;
+    for (unsigned int timeout = 0; timeout < 200000; timeout++) {
+        if (!(EHCI_HCOR->usbsts & EHCI_USBSTS_PSS)) return true;
     }
-    return (0x1 << (order % 8));
+    EHCI_HCOR->usbcmd |= EHCI_USBCMD_PSEN;
+    USB_LOG_ERR("periodic stop timeout\r\n");
+    return false;
 }
 
 static void ehci_qh_fill(struct ehci_qh_hw *qh,
@@ -606,8 +653,9 @@ static struct ehci_qh_hw *ehci_intr_urb_init(struct usbh_bus *bus, struct usbh_u
 
     qh->urb = urb;
     urb->hcpriv = qh;
-    /* add qh into periodic list */
-    ehci_qh_add_head(&g_periodic_qh_head[bus->hcd.hcd_id], qh);
+    /* Publish only fully initialized descriptors into the selected period. */
+    unsigned int level = ehci_periodic_level(urb->hport->speed, urb->ep->bInterval);
+    ehci_qh_add_head(&g_periodic_qh_head[bus->hcd.hcd_id][level], qh);
 
     EHCI_HCOR->usbcmd |= EHCI_USBCMD_PSEN;
 
@@ -649,7 +697,10 @@ static void ehci_qh_scan_qtds(struct usbh_bus *bus, struct ehci_qh_hw *qhead, st
     qtd = EHCI_ADDR2QTD(qh->first_qtd);
 
     while (qtd) {
-        qtd->urb->actual_length += (qtd->length - ((qtd->hw.token & QTD_TOKEN_NBYTES_MASK) >> QTD_TOKEN_NBYTES_SHIFT));
+        /* SETUP is protocol overhead, not bytes in the caller's data buffer. */
+        if ((qtd->hw.token & QTD_TOKEN_PID_MASK) != QTD_TOKEN_PID_SETUP) {
+            qtd->urb->actual_length += (qtd->length - ((qtd->hw.token & QTD_TOKEN_NBYTES_MASK) >> QTD_TOKEN_NBYTES_SHIFT));
+        }
 
         qtd = EHCI_ADDR2QTD(qtd->hw.next_qtd);
     }
@@ -683,6 +734,8 @@ static void ehci_check_qh(struct usbh_bus *bus, struct ehci_qh_hw *qhead, struct
     }
 
     urb = qh->urb;
+    bool periodic = USB_GET_ENDPOINT_TYPE(urb->ep->bmAttributes) == USB_ENDPOINT_TYPE_INTERRUPT;
+    if (periodic && !ehci_periodic_pause(bus)) return;
 
     if ((token & QTD_TOKEN_STATUS_ERRORS) == 0) {
         if (token & QTD_TOKEN_TOGGLE) {
@@ -705,7 +758,9 @@ static void ehci_check_qh(struct usbh_bus *bus, struct ehci_qh_hw *qhead, struct
 
     ehci_qh_scan_qtds(bus, qhead, qh);
 
-    if (USB_GET_ENDPOINT_TYPE(urb->ep->bmAttributes) == USB_ENDPOINT_TYPE_INTERRUPT) {
+    if (periodic) {
+        __sync_synchronize();
+        EHCI_HCOR->usbcmd |= EHCI_USBCMD_PSEN;
         ehci_urb_waitup(bus, urb);
     } else {
 #if 0
@@ -825,21 +880,10 @@ int usb_hc_init(struct usbh_bus *bus)
 
     memset(g_framelist[bus->hcd.hcd_id], 0, sizeof(uint32_t) * CONFIG_USB_EHCI_FRAME_LIST_SIZE);
 
-    memset(&g_periodic_qh_head[bus->hcd.hcd_id], 0, sizeof(struct ehci_qh_hw));
-    g_periodic_qh_head[bus->hcd.hcd_id].hw.hlp = QH_HLP_END;
-    g_periodic_qh_head[bus->hcd.hcd_id].hw.epchar = QH_EPCAPS_SSMASK(1);
-    g_periodic_qh_head[bus->hcd.hcd_id].hw.overlay.next_qtd = QTD_LIST_END;
-    g_periodic_qh_head[bus->hcd.hcd_id].hw.overlay.alt_next_qtd = QTD_LIST_END;
-    g_periodic_qh_head[bus->hcd.hcd_id].hw.overlay.token = QTD_TOKEN_STATUS_HALTED;
-    g_periodic_qh_head[bus->hcd.hcd_id].first_qtd = QTD_LIST_END;
-
-    for (uint32_t i = 0; i < CONFIG_USB_EHCI_FRAME_LIST_SIZE; i++) {
-        g_framelist[bus->hcd.hcd_id][i] = QH_HLP_QH(&g_periodic_qh_head[bus->hcd.hcd_id]);
-    }
+    ehci_periodic_init(bus);
 
 #if defined(CONFIG_USB_EHCI_DESC_DCACHE_ENABLE)
     usb_dcache_clean((uintptr_t)&g_async_qh_head[bus->hcd.hcd_id].hw, CONFIG_USB_EHCI_ALIGN_SIZE);
-    usb_dcache_clean((uintptr_t)&g_periodic_qh_head[bus->hcd.hcd_id].hw, CONFIG_USB_EHCI_ALIGN_SIZE);
     usb_dcache_clean((uintptr_t)g_framelist[bus->hcd.hcd_id], sizeof(uint32_t) * CONFIG_USB_EHCI_FRAME_LIST_SIZE);
 #endif
 
@@ -1224,6 +1268,11 @@ int usbh_submit_urb(struct usbh_urb *urb)
                    "urb->setup or urb->transfer_buffer is not aligned %d", CONFIG_USB_ALIGN_SIZE);
 #endif
     bus = urb->hport->bus;
+    if (USB_GET_ENDPOINT_TYPE(urb->ep->bmAttributes) == USB_ENDPOINT_TYPE_INTERRUPT &&
+        (urb->ep->bInterval == 0 ||
+         (urb->hport->speed == USB_SPEED_HIGH && urb->ep->bInterval > 16))) {
+        return -USB_ERR_INVAL;
+    }
 
     /* find active hubport in roothub */
     hport = urb->hport;
@@ -1322,6 +1371,21 @@ int usbh_kill_urb(struct usbh_urb *urb)
 
     flags = usb_osal_enter_critical_section();
 
+    if (USB_GET_ENDPOINT_TYPE(urb->ep->bmAttributes) == USB_ENDPOINT_TYPE_INTERRUPT) {
+        if (!ehci_periodic_pause(bus)) {
+            usb_osal_leave_critical_section(flags);
+            return -USB_ERR_TIMEOUT;
+        }
+        qh = (struct ehci_qh_hw *)urb->hcpriv;
+        ehci_kill_qh(bus, &g_periodic_qh_head[bus->hcd.hcd_id][EHCI_PERIODIC_LEVELS - 1], qh);
+        __sync_synchronize();
+        EHCI_HCOR->usbcmd |= EHCI_USBCMD_PSEN;
+        urb->errorcode = -USB_ERR_SHUTDOWN;
+        ehci_urb_waitup(bus, urb);
+        usb_osal_leave_critical_section(flags);
+        return 0;
+    }
+
     EHCI_HCOR->usbcmd &= ~(EHCI_USBCMD_PSEN | EHCI_USBCMD_ASEN);
 
     if ((USB_GET_ENDPOINT_TYPE(urb->ep->bmAttributes) == USB_ENDPOINT_TYPE_CONTROL) || (USB_GET_ENDPOINT_TYPE(urb->ep->bmAttributes) == USB_ENDPOINT_TYPE_BULK)) {
@@ -1330,14 +1394,6 @@ int usbh_kill_urb(struct usbh_urb *urb)
             if (qh->urb == urb) {
                 remove_in_iaad = true;
                 ehci_kill_qh(bus, &g_async_qh_head[bus->hcd.hcd_id], qh);
-            }
-            qh = EHCI_ADDR2QH(qh->hw.hlp);
-        }
-    } else if (USB_GET_ENDPOINT_TYPE(urb->ep->bmAttributes) == USB_ENDPOINT_TYPE_INTERRUPT) {
-        qh = EHCI_ADDR2QH(g_periodic_qh_head[bus->hcd.hcd_id].hw.hlp);
-        while (qh) {
-            if (qh->urb == urb) {
-                ehci_kill_qh(bus, &g_periodic_qh_head[bus->hcd.hcd_id], qh);
             }
             qh = EHCI_ADDR2QH(qh->hw.hlp);
         }
@@ -1403,12 +1459,15 @@ static void ehci_scan_periodic_list(struct usbh_bus *bus)
 {
     struct ehci_qh_hw *qh;
 
-    qh = EHCI_ADDR2QH(g_periodic_qh_head[bus->hcd.hcd_id].hw.hlp);
+    struct ehci_qh_hw *head = &g_periodic_qh_head[bus->hcd.hcd_id][EHCI_PERIODIC_LEVELS - 1];
+    qh = EHCI_ADDR2QH(head->hw.hlp);
     while (qh) {
+        /* Completion may free/reuse qh in a callback. Save its successor first. */
+        struct ehci_qh_hw *next = EHCI_ADDR2QH(qh->hw.hlp);
         if (qh->urb) {
-            ehci_check_qh(bus, &g_periodic_qh_head[bus->hcd.hcd_id], qh);
+            ehci_check_qh(bus, head, qh);
         }
-        qh = EHCI_ADDR2QH(qh->hw.hlp);
+        qh = next;
     }
 }
 
