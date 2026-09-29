@@ -88,6 +88,10 @@ static int backtrace_once;
 #endif
 void coredump_run(void)
 {
+    /* Keep the exception header visible; memory dumps are requested over UART. */
+    print_build_id_fmt(elf_build_id);
+    goto __dump_end;
+
 __restart:
     skip_coredump = 0;
     if(&_dump_sections == 0) {
@@ -133,6 +137,7 @@ __dump_end:
     }
 #endif
 
+    puts("\r\nCrash halted. Send '@' for memory dump, '$' to stop dumping.\r\n");
     while (1) {
         if('@' == bflb_uart_getchar(bflb_device_get_by_name("uart0"))) {
             goto __restart;

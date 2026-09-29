@@ -370,8 +370,9 @@ freertos_risc_v_trap_handler:
     csrr a0, mcause
     csrr a1, mepc
 
-    /* There is other content in the mcause register of E907 */
-    li t0, 0x807FFFFF
+    /* E907 CLIC: keep Interrupt[31] and Exception Code[11:0].
+     * MPIL and the other saved status fields must not affect dispatch. */
+    li t0, 0x80000FFF
     and a0, a0, t0
 
     bge a0, x0, synchronous_exception
