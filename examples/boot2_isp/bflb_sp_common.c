@@ -101,7 +101,9 @@ int32_t bflb_sp_mediaboot_pre_jump(void)
     /* Jump to entry */
     __disable_irq();
     boot2_wdt_feed();
+#ifndef CONFIG_MX_BOOT2
     boot2_wdt_disable();
+#endif
     bflb_sp_boot2_jump_entry();
     boot2_wdt_init();
     return BFLB_BOOT2_SUCCESS;

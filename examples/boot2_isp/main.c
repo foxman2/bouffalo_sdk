@@ -621,6 +621,12 @@ int main(void)
         BOOT2_MSG_WAR("Boot return 0x%x\r\nCheck Rollback\r\n", ret);
 
     ROLLBACK_CHECK:
+#ifdef CONFIG_MX_BOOT2
+        /* The project PT hook owns retries and preserves the stable table.
+         * Never let the generic image-error fallback overwrite that table. */
+        GLB_SW_POR_Reset();
+        while (1) {}
+#endif
         for (i = 0; i < BFLB_SP_BOOT2_CPU_GROUP_MAX; i++) {
             if (boot_need_rollback[i] != 0) {
                 BOOT2_MSG_WAR("Rollback group %d\r\n", i);
